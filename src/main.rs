@@ -1,20 +1,7 @@
 mod registers;
 mod stacked;
 
-use std::{
-    borrow::Cow,
-    collections::HashSet,
-    convert::TryInto,
-    fs,
-    io::{self, Write as _},
-    mem,
-    path::{Path, PathBuf},
-    process,
-    str::FromStr,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{borrow::Cow, collections::HashSet, convert::TryInto, fs, io::{self, Read, Write as _}, mem, path::{Path, PathBuf}, process, str::FromStr, sync::atomic::{AtomicBool, Ordering}, sync::{Arc, Mutex}, time::Duration};
 
 use addr2line::fallible_iterator::FallibleIterator as _;
 use anyhow::{anyhow, bail, Context};
@@ -26,6 +13,7 @@ use gimli::{
     BaseAddresses, LittleEndian, UninitializedUnwindContext,
 };
 use log::Level;
+use mio_serial::{Serial, SerialPortSettings};
 use object::{
     read::{File as ElfFile, Object as _, ObjectSection as _},
     ObjectSegment, ObjectSymbol, SymbolSection,
@@ -86,6 +74,12 @@ struct Opts {
     /// Connect to device when NRST is pressed.
     #[structopt(long)]
     connect_under_reset: bool,
+
+    #[structopt(short, long = "--interface", parse(from_os_str))]
+    interface: Option<PathBuf>,
+
+    #[structopt(short, long = "--baudrate", default_value = "230400")]
+    baudrate: u32,
 
     /// Enable more verbose logging.
     #[structopt(short, long)]
@@ -171,7 +165,7 @@ fn notmain() -> anyhow::Result<i32> {
         })?;
 
     let (mut table, locs) = {
-        let table = defmt_decoder::Table::parse(&bytes)?;
+        let table = defmt_decoder::Table::parse_ignore_version(&bytes)?;
 
         let locs = if let Some(table) = table.as_ref() {
             let locs = table.get_locations(&bytes)?;
@@ -393,24 +387,28 @@ fn notmain() -> anyhow::Result<i32> {
     let sigid = signal_hook::flag::register(signal::SIGINT, exit.clone())?;
 
     let sess = Arc::new(Mutex::new(sess));
-    let mut logging_channel = setup_logging_channel(rtt_addr, sess.clone())?;
 
-    // `defmt-rtt` names the channel "defmt", so enable defmt decoding in that case.
-    let use_defmt = logging_channel
-        .as_ref()
-        .map_or(false, |ch| ch.name() == Some("defmt"));
-
-    if use_defmt && opts.no_flash {
-        bail!(
-            "attempted to use `--no-flash` and `defmt` logging -- this combination is not allowed. Remove the `--no-flash` flag"
-        );
-    } else if use_defmt && table.is_none() {
-        bail!("\"defmt\" RTT channel is in use, but the firmware binary contains no defmt data");
-    }
-
-    if !use_defmt {
-        table = None;
-    }
+    let mut logging_channel = if opts.interface.is_some() {
+        setup_serial_logging_channel(opts.interface, opts.baudrate)
+    } else {
+        let logging_channel = setup_logging_channel(rtt_addr, sess.clone())?;
+        // `defmt-rtt` names the channel "defmt", so enable defmt decoding in that case.
+        let use_defmt = logging_channel
+            .as_ref()
+            .map_or(false, |ch| ch.name() == Some("defmt"));
+    
+        if use_defmt && opts.no_flash {
+            bail!(
+                "attempted to use `--no-flash` and `defmt` logging -- this combination is not allowed. Remove the `--no-flash` flag"
+            );
+        } else if use_defmt && table.is_none() {
+            bail!("\"defmt\" RTT channel is in use, but the firmware binary contains no defmt data");
+        }
+        if !use_defmt {
+            table = None;
+        }
+        logging_channel.map(|c| Box::new(c) as Box<dyn Read>)
+    };
 
     // Print a separator before the device messages start.
     eprintln!("{}", "─".repeat(80).dimmed());
@@ -427,8 +425,9 @@ fn notmain() -> anyhow::Result<i32> {
         if let Some(logging_channel) = &mut logging_channel {
             let num_bytes_read = match logging_channel.read(&mut read_buf) {
                 Ok(n) => n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { continue },
                 Err(e) => {
-                    eprintln!("RTT error: {}", e);
+                    eprintln!("Log error: {}", e);
                     break;
                 }
             };
@@ -472,8 +471,12 @@ fn notmain() -> anyhow::Result<i32> {
                             }
                             Err(defmt_decoder::DecodeError::UnexpectedEof) => break,
                             Err(defmt_decoder::DecodeError::Malformed) => {
-                                log::error!("failed to decode defmt data: {:x?}", frames);
-                                return Err(defmt_decoder::DecodeError::Malformed.into());
+                                // log::error!("failed to decode defmt data: {:x?}", frames);
+                                // return Err(defmt_decoder::DecodeError::Malformed.into());
+                                let num_frames = frames.len();
+                                frames.rotate_left(1);
+                                frames.truncate(num_frames - 1);
+                                break;
                             }
                         }
                     }
@@ -567,6 +570,22 @@ fn program_size_of(file: &ElfFile) -> u64 {
 enum TopException {
     HardFault { stack_overflow: bool },
     Other,
+}
+
+fn setup_serial_logging_channel(interface: Option<PathBuf>, baudrate: u32) -> Option<Box<dyn Read>> {
+    if let Some(iface) = interface.as_ref() {
+        if iface.to_str() == Some("-") {
+            let stdin = io::stdin();
+            Some(Box::new(stdin) as Box<dyn Read>)
+        } else {
+            let mut settings = SerialPortSettings::default();
+            settings.baud_rate = baudrate;
+            let port = Serial::from_path(iface, &settings).expect("Failed to open a serial port");
+            Some(Box::new(port) as Box<dyn Read>)
+        }
+    } else {
+        None
+    }
 }
 
 fn setup_logging_channel(
